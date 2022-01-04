@@ -15,6 +15,61 @@ module Fastlane
         Spaceship::ConnectAPI.login(params[:username], use_portal: false, use_tunes: true)
         UI.message("Login successful")
 
+        valid_identifiers = self.get_revenuecat_product_identifiers(params)
+
+				paths = Dir["*.storekit"].map do |path|
+					File.absolute_path(path)
+				end
+				if paths.empty?
+					UI.user_error!("Please add a StoreKit Configuration File to your Xcode project first and then rerun this in that directory")
+        else
+					path = UI.select("Which storekit file would you like to update?", paths)
+				end
+
+				json = make_storekit_config_json(params, valid_identifiers)
+
+				File.write(path, json)
+				UI.important("Updating StoreKit Configuration File at #{path}")
+
+				nil
+			end
+
+      def self.get_revenuecat_product_identifiers(params)
+        if params[:revenuecat_api_key].nil?
+          return []
+        end 
+
+        require 'uri'
+        require 'net/http'
+        require 'openssl'
+        require 'json'
+
+        url = URI("https://api.revenuecat.com/v1/subscribers/app_user_id/offerings")
+
+        http = Net::HTTP.new(url.host, url.port)
+        http.use_ssl = true
+
+        request = Net::HTTP::Get.new(url)
+        request["Accept"] = 'application/json'
+        request["X-Platform"] = 'ios'
+        request["Content-Type"] = 'application/json'
+        request["Authorization"] = "Bearer #{params[:revenuecat_api_key]}"
+
+        response = http.request(request)
+        json = JSON.parse(response.read_body)
+
+        identifiers = json['offerings'].map do |offering|
+          offering['packages'].map do |package|
+            package['platform_product_identifier']
+          end
+        end.flatten.uniq
+
+        UI.message("Found RevenueCat product identifiers: #{identifiers.join(', ')}")
+
+        return identifiers
+      end
+
+			def self.make_storekit_config_json(params, valid_identifiers)
 				app = Spaceship::ConnectAPI::App.find(params[:app_identifier])
 		
 				r = Spaceship::Tunes.client.iaps(app_id: app.id)
@@ -23,32 +78,31 @@ module Fastlane
 				non_renewing_subs = []
 				subscription_groups = {}
 
-#				{"familyReferenceName"=>nil,
-#				 "durationDays"=>0,
-#				 "numberOfCodes"=>0,
-#				 "maximumNumberOfCodes"=>100,
-#				 "appMaximumNumberOfCodes"=>1000,
-#				 "isEditable"=>false,
-#				 "isRequired"=>false,
-#				 "canDeleteAddOn"=>true,
-#				 "errorKeys"=>nil,
-#				 "isEmptyValue"=>false,
-#				 "itcsubmitNextVersion"=>false,
-#				 "adamId"=>"1600810028",
-#				 "referenceName"=>"consume",
-#				 "vendorId"=>"consume",
-#				 "addOnType"=>"ITC.addons.type.consumable",
-#				 "versions"=>
-#					[{"screenshotUrl"=>nil,
-#						"canSubmit"=>false,
-#						"issuesCount"=>0,
-#						"itunesConnectStatus"=>"missingMetadata"}],
-#				 "purpleSoftwareAdamIds"=>["1594507974"],
-#				 "lastModifiedDate"=>1639706393000,
-#				 "isNewsSubscription"=>false,
-#				 "iTunesConnectStatus"=>"missingMetadata"}
-
 				r.each do |product|
+          full_iap = Spaceship::Tunes.client.load_iap(app_id: app.id, purchase_id: product["adamId"])
+          require 'pp'
+
+          localizations = []
+
+          if (version = full_iap['versions'].first)
+            (version['details']['value'] || []).each do |detail|
+              locale_code = detail['value']['localeCode']
+              name = detail['value']['name']['value']
+              description = detail['value']['description']['value']
+
+              localizations << {
+                "description": description,
+                "displayName": name,
+                "locale": locale_code
+              }
+            end
+          end
+
+          if !valid_identifiers.empty? && !valid_identifiers.include?(product["vendorId"])
+            UI.important("Not found on RevenueCat. Rejecting '#{product["vendorId"]}'")
+            next
+          end
+
 					if product["addOnType"] == "ITC.addons.type.consumable" || product["addOnType"] == "ITC.addons.type.nonConsumable" || (product["addOnType"] == "ITC.addons.type.subscription" && product["durationDays"] == 0 )
 
 						type =  if product["addOnType"] == "ITC.addons.type.subscription" && product["durationDays"] == 0
@@ -63,13 +117,7 @@ module Fastlane
 							"displayPrice": "",
 							"familyShareable": false,
 							"internalID": random_hex,
-							"localizations": [
-								{
-									"description": "",
-									"displayName": "",
-									"locale": "en_US"
-								}
-							],
+							"localizations": localizations,
 							"productID": product["vendorId"],
 							"referenceName": product["referenceName"],
 							"type": product["addOnType"] == "ITC.addons.type.consumable" ? "Consumable" : "NonConsumable"
@@ -102,13 +150,7 @@ module Fastlane
 							"groupNumber": 1,
 							"internalID": random_hex,
 							"introductoryOffer": nil,
-							"localizations": [
-								{
-									"description": "",
-									"displayName": "",
-									"locale": "en_US"
-								}
-							],
+							"localizations": localizations,
 							"productID": product["vendorId"],
 							"recurringSubscriptionPeriod": period,
 							"referenceName": product["referenceName"],
@@ -178,6 +220,11 @@ module Fastlane
                                        verify_block: proc do |value|
                                          ENV["FASTLANE_ITC_TEAM_NAME"] = value.to_s
                                        end),
+          FastlaneCore::ConfigItem.new(key: :revenuecat_api_key,
+                                       env_name: "STOREKIT_REVENUECAT_API_KEY",
+                                       description: "The RevenueCat API Key for your Apple app used to filter only IAPs that are used in offerings",
+                                       optional: true,
+                                       code_gen_sensitive: true)
         ]
       end
 
